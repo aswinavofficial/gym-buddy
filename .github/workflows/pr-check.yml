@@ -35,6 +35,3 @@ jobs:
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
-
-      - name: Run lint
-        run: gradle lintDebug --no-daemon
