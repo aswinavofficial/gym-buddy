@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Gym Buddy</string>
+    <string name="widget_description">Your streak and next workout</string>
+</resources>
