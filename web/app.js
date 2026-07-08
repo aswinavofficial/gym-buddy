@@ -1,19 +1,34 @@
-/* Gym Buddy — vanilla JS PWA. State lives in localStorage. */
+/* Gym Buddy — vanilla JS PWA. State lives in localStorage; full exercise catalog lives in IndexedDB (lazy). */
 'use strict';
 
 const STORE_KEY = 'gymbuddy.v1';
-const REST_DAY = {
-  key: 'sun', title: 'Rest & Recovery', weekday: 0, accent: '#3DDBD9',
-  tips: ['Complete rest', 'Light walk or yoga', 'Focus on mobility', 'Hydrate & eat clean', 'Prepare for next week'],
-};
+const REST_DAY = { accent: '#3DDBD9', tips: ['Complete rest', 'Light walk or yoga', 'Focus on mobility', 'Hydrate & eat clean', 'Prepare for next week'] };
+const WD_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const WD_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const GROUP_ORDER = ['chest', 'back', 'shoulders', 'upper arms', 'lower arms', 'upper legs', 'lower legs', 'waist', 'cardio', 'neck'];
+const DEFAULT_WEEK = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
 /* ---------- store ---------- */
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (s && s.v === 1) return s;
+    if (s && s.v === 1) {
+      if (!s.week) s.week = [...DEFAULT_WEEK];
+      if (s.startWeekday == null) s.startWeekday = 1;
+      if (!s.customDays) s.customDays = {};
+      if (!s.customDayDefs) s.customDayDefs = {};
+      if (!s.customExercises) s.customExercises = {};
+      if (!s.nextDayId) s.nextDayId = 1;
+      if (s.installDismissedAt === undefined) s.installDismissedAt = null;
+      return s;
+    }
   } catch (e) { /* corrupted → start fresh */ }
-  return { v: 1, sessions: [], active: null, settings: { restSec: 90 } };
+  return {
+    v: 1, sessions: [], active: null, settings: { restSec: 90 },
+    week: [...DEFAULT_WEEK], startWeekday: 1,
+    customDays: {}, customDayDefs: {}, customExercises: {}, nextDayId: 1,
+    installDismissedAt: null,
+  };
 }
 function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
 let state = load();
@@ -21,13 +36,31 @@ let state = load();
 const $ = (sel, el) => (el || document).querySelector(sel);
 const $$ = (sel, el) => [...(el || document).querySelectorAll(sel)];
 const view = $('#view');
-const dayByKey = k => SPLIT.find(d => d.key === k);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const titleCase = s => String(s).replace(/\b\w/g, c => c.toUpperCase());
 
-function todayDay() {
-  const wd = new Date().getDay();
-  return SPLIT.find(d => d.weekday === wd) || null; // null → rest day
+/* ---------- plan resolution (built-in templates + custom overrides) ---------- */
+const dayByKey = k => SPLIT.find(d => d.key === k); // built-in template lookup only
+
+function planDayDef(key) {
+  const custom = state.customDayDefs[key];
+  const base = custom || dayByKey(key);
+  if (!base) return null;
+  const items = state.customDays[key] || base.items;
+  return { key, title: base.title, focus: base.focus, accent: base.accent, items };
 }
+
+function todayKey() {
+  const wd = new Date().getDay();
+  const idx = ((wd - state.startWeekday) % 7 + 7) % 7;
+  return idx < state.week.length ? state.week[idx] : null;
+}
+function weekdayLabelFor(key) {
+  const idx = state.week.indexOf(key);
+  if (idx === -1) return null;
+  return WD_FULL[(state.startWeekday + idx) % 7];
+}
+function newDayKey() { const k = 'c' + state.nextDayId; state.nextDayId++; return k; }
 
 /* Last logged sets for an exercise across finished sessions (newest first).
    Session logs only ever contain completed sets. */
@@ -54,34 +87,125 @@ function progressionHint(item) {
   return null;
 }
 
+/* ---------- exercise lookup: curated (offline-guaranteed) → plan overrides → full catalog ---------- */
+function getEx(id) { return EXERCISES[id] || state.customExercises[id] || catalogMap.get(id) || null; }
+
+/* ---------- IndexedDB: full 1,324-exercise catalog, loaded lazily on first use ---------- */
+const DB_NAME = 'gymbuddy', DB_STORE = 'exercises';
+let catalogMap = new Map();
+let catalogLoading = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE, { keyPath: 'id' });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGetAll(db) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbPutAll(db, rows) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    const os = tx.objectStore(DB_STORE);
+    rows.forEach(r => os.put(r));
+    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+  });
+}
+/* Only called when the Library tab or an exercise picker is opened — never at startup. */
+function ensureCatalog() {
+  if (catalogMap.size) return Promise.resolve(catalogMap);
+  if (catalogLoading) return catalogLoading;
+  catalogLoading = (async () => {
+    try {
+      const db = await openDB();
+      const rows = await idbGetAll(db);
+      if (rows.length) { rows.forEach(r => catalogMap.set(r.id, r)); return catalogMap; }
+      const data = await (await fetch('catalog.json')).json();
+      await idbPutAll(db, data);
+      data.forEach(r => catalogMap.set(r.id, r));
+    } catch (e) { /* offline on first-ever load with no cached catalog — Library shows an error state */ }
+    return catalogMap;
+  })();
+  return catalogLoading;
+}
+
+/* ---------- fuzzy search (pure JS, no deps) ---------- */
+function fuzzyScore(text, query) {
+  if (!text) return -1;
+  text = text.toLowerCase();
+  if (text === query) return 1000;
+  if (text.startsWith(query)) return 900;
+  if (text.split(/\s+/).some(w => w.startsWith(query))) return 800;
+  const idx = text.indexOf(query);
+  if (idx !== -1) return Math.max(1, 700 - idx);
+  let ti = 0, first = -1, last = -1;
+  for (let qi = 0; qi < query.length; qi++) {
+    const found = text.indexOf(query[qi], ti);
+    if (found === -1) return -1;
+    if (first === -1) first = found;
+    last = found; ti = found + 1;
+  }
+  return Math.max(1, 500 - (last - first + 1));
+}
+function fuzzySearch(items, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return items;
+  const scored = [];
+  for (const it of items) {
+    const hay = `${it.name} ${it.target} ${it.equipment} ${it.group}`;
+    let best = fuzzyScore(hay, q);
+    const nameScore = fuzzyScore(it.name, q);
+    if (nameScore > -1) best = Math.max(best, nameScore + 50);
+    if (best > -1) scored.push([best, it]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  return scored.map(x => x[1]);
+}
+
 /* ---------- router ---------- */
 window.addEventListener('hashchange', render);
 window.addEventListener('DOMContentLoaded', render);
+let pickCtx = null; // { dayKey, index, dayTitle, returnHash } while the Library is acting as an exercise picker
 
 function render() {
-  stopTicker();
   const hash = location.hash.replace(/^#\/?/, '');
   const [route, arg] = hash.split('/');
   let nav = 'today';
   if (route === 'week') { renderWeek(); nav = 'week'; }
+  else if (route === 'plan') { renderPlanEditor(); nav = 'week'; }
+  else if (route === 'library') { pickCtx = null; renderLibrary(); nav = 'library'; }
+  else if (route === 'pick') { if (!pickCtx) { location.hash = '#/library'; return; } renderLibrary(); nav = ''; }
   else if (route === 'history') { renderHistory(); nav = 'history'; }
   else if (route === 'settings') { renderSettings(); nav = 'settings'; }
   else if (route === 'ex') { renderExercise(arg); nav = ''; }
   else if (route === 'session') { renderSession(); nav = ''; }
-  else if (route === 'day') { renderDay(dayByKey(arg)); nav = 'week'; }
-  else { renderDay(todayDay(), true); }
+  else if (route === 'edit') { renderDayEditor(arg); nav = ''; }
+  else if (route === 'day') { renderDay(arg, arg === todayKey()); nav = 'week'; }
+  else if (route === 'rest') { renderRest(todayKey() === null); nav = 'today'; }
+  else { const k = todayKey(); if (k) renderDay(k, true); else renderRest(true); nav = 'today'; }
   $$('#bottom-nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === nav));
   view.scrollTop = 0; window.scrollTo(0, 0);
 }
 
 /* ---------- day (today / week detail) ---------- */
-function renderDay(day, isToday) {
-  if (!day) return renderRest(isToday);
-  const dayName = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday' }[day.key];
-  const active = state.active && state.active.day === day.key;
+function renderDay(key, isToday) {
+  const day = planDayDef(key);
+  if (!day) { location.hash = '#/week'; return; }
+  const wdLabel = weekdayLabelFor(key);
+  const active = state.active && state.active.day === key;
+  const customized = !!state.customDays[key];
   let lastSection = null;
   const cards = day.items.map((it, i) => {
-    const ex = EXERCISES[it.ex];
+    const ex = getEx(it.ex) || { gif: '', equipment: '', target: '' };
     const sec = it.section && it.section !== lastSection ? `<div class="section-label">${esc(it.section)}</div>` : '';
     lastSection = it.section || lastSection;
     return `${sec}
@@ -97,14 +221,15 @@ function renderDay(day, isToday) {
 
   view.innerHTML = `
     <div class="screen-head" style="--accent:${day.accent}">
-      <div class="eyebrow" style="color:${day.accent}">${isToday ? 'Today · ' : ''}${dayName}</div>
+      <div class="eyebrow" style="color:${day.accent}">${isToday ? 'Today · ' : ''}${wdLabel || ''}${customized ? ' <span class="edited-badge">edited</span>' : ''}</div>
       <h1>${esc(day.title)}</h1>
       <div class="sub">${esc(day.focus)} · ${day.items.length} exercises</div>
     </div>
-    ${cards}
-    <button class="btn" id="start" style="background:${day.accent}">${active ? 'Resume workout' : 'Start workout'}</button>`;
+    ${cards || '<div class="empty"><span class="emoji">🗒️</span>No exercises yet — customize this day to add some.</div>'}
+    <a class="btn ghost" href="#/edit/${key}" style="text-align:center;text-decoration:none;color:var(--text);display:block">Customize workout</a>
+    <button class="btn" id="start" style="background:${day.accent}" ${day.items.length ? '' : 'disabled'}>${active ? 'Resume workout' : 'Start workout'}</button>`;
   $('#start').onclick = () => {
-    if (!active) startSession(day.key);
+    if (!active) startSession(key);
     location.hash = '#/session';
   };
 }
@@ -112,7 +237,7 @@ function renderDay(day, isToday) {
 function renderRest(isToday) {
   view.innerHTML = `
     <div class="screen-head">
-      <div class="eyebrow" style="color:${REST_DAY.accent}">${isToday ? 'Today · ' : ''}Sunday</div>
+      <div class="eyebrow" style="color:${REST_DAY.accent}">${isToday ? 'Today · ' : ''}Rest Day</div>
       <h1>Rest & Recovery</h1>
     </div>
     <div class="rest-hero">
@@ -126,45 +251,274 @@ function renderRest(isToday) {
 
 /* ---------- week ---------- */
 function renderWeek() {
-  const names = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
-  const wd = new Date().getDay();
-  const tiles = [...SPLIT, REST_DAY].map(d => `
-    <a class="day-tile" href="${d.key === 'sun' ? '#/day/sun' : `#/day/${d.key}`}" style="--day-accent:${d.accent}">
-      <div class="day-dot">${names[d.key]}</div>
+  const tk = todayKey();
+  const rows = state.week.map((key, i) => {
+    const d = planDayDef(key);
+    if (!d) return '';
+    const wd = (state.startWeekday + i) % 7;
+    const customized = !!state.customDays[key];
+    return `<a class="day-tile" href="#/day/${key}" style="--day-accent:${d.accent}">
+      <div class="day-dot">${WD_SHORT[wd]}</div>
       <div class="card-body">
-        <div class="card-title">${esc(d.title)}</div>
-        <div class="card-meta">${d.items ? d.items.length + ' exercises' : 'Recovery'}</div>
+        <div class="card-title">${esc(d.title)}${customized ? ' <span class="edited-badge">edited</span>' : ''}</div>
+        <div class="card-meta">${d.items.length} exercises</div>
       </div>
-      ${d.weekday === wd ? '<span class="today-badge">TODAY</span>' : '<span class="chev">›</span>'}
-    </a>`).join('');
+      ${key === tk ? '<span class="today-badge">TODAY</span>' : '<span class="chev">›</span>'}
+    </a>`;
+  }).join('');
+  const restRows = [];
+  for (let i = state.week.length; i < 7; i++) {
+    const wd = (state.startWeekday + i) % 7;
+    const isTodayRest = tk === null && wd === new Date().getDay();
+    restRows.push(`<a class="day-tile" href="#/rest" style="--day-accent:${REST_DAY.accent}">
+      <div class="day-dot">${WD_SHORT[wd]}</div>
+      <div class="card-body"><div class="card-title">Rest & Recovery</div><div class="card-meta">Recovery</div></div>
+      ${isTodayRest ? '<span class="today-badge">TODAY</span>' : '<span class="chev">›</span>'}
+    </a>`);
+  }
   view.innerHTML = `
-    <div class="screen-head"><h1>6-Day Split</h1>
-    <div class="sub">Build muscle · Lose fat · Stay consistent</div></div>${tiles}`;
+    <div class="screen-head"><h1>${state.week.length}-Day Split</h1>
+    <div class="sub">Build muscle · Lose fat · Stay consistent</div></div>
+    ${rows}${restRows.join('')}
+    <a class="btn ghost" href="#/plan" style="text-align:center;text-decoration:none;color:var(--text);display:block">Edit plan</a>`;
+}
+
+/* ---------- plan structure editor (days count + start weekday) ---------- */
+function renderPlanEditor() {
+  const restCount = 7 - state.week.length;
+  const rows = state.week.map((key, i) => {
+    const d = planDayDef(key) || { title: '(missing)', accent: '#666' };
+    const wd = (state.startWeekday + i) % 7;
+    return `<div class="plan-row" style="--day-accent:${d.accent}">
+      <div class="day-dot">${WD_SHORT[wd]}</div>
+      <div class="card-body"><div class="card-title">${esc(d.title)}</div></div>
+      <div class="plan-actions">
+        <button class="icon-btn up-btn" data-i="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
+        <button class="icon-btn down-btn" data-i="${i}" ${i === state.week.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
+        <button class="icon-btn remove-day-btn" data-i="${i}" ${state.week.length <= 1 ? 'disabled' : ''} aria-label="Remove">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+  view.innerHTML = `
+    <a class="back-link" href="#/week">‹ Back</a>
+    <div class="screen-head"><h1>Edit Plan</h1><div class="sub">${state.week.length} training days · ${restCount} rest day${restCount === 1 ? '' : 's'}</div></div>
+    <div class="section-label">Start day</div>
+    <div class="chip-row">${WD_SHORT.map((n, i) => `<button class="wd-chip ${i === state.startWeekday ? 'on' : ''}" data-wd="${i}">${n}</button>`).join('')}</div>
+    <div class="section-label">Training days (in order)</div>
+    ${rows}
+    <button class="btn ghost" id="add-day">+ Add day</button>`;
+
+  $$('.wd-chip').forEach(b => b.onclick = () => { state.startWeekday = +b.dataset.wd; save(); renderPlanEditor(); });
+  $$('.up-btn').forEach(b => b.onclick = () => {
+    const i = +b.dataset.i; [state.week[i - 1], state.week[i]] = [state.week[i], state.week[i - 1]];
+    save(); renderPlanEditor();
+  });
+  $$('.down-btn').forEach(b => b.onclick = () => {
+    const i = +b.dataset.i; [state.week[i + 1], state.week[i]] = [state.week[i], state.week[i + 1]];
+    save(); renderPlanEditor();
+  });
+  $$('.remove-day-btn').forEach(b => b.onclick = () => {
+    if (state.week.length <= 1) return;
+    state.week.splice(+b.dataset.i, 1); save(); renderPlanEditor();
+  });
+  $('#add-day').onclick = showAddDayMenu;
+}
+
+function showAddDayMenu() {
+  const el = document.createElement('div');
+  el.className = 'overlay';
+  el.innerHTML = `<div class="modal" style="text-align:left">
+    <h2 style="text-align:center">Add a day</h2>
+    <div class="section-label" style="text-align:center">Templates</div>
+    ${SPLIT.map(d => `<button class="btn ghost tmpl-btn">${esc(d.title)}</button>`).join('')}
+    <button class="btn ghost" id="blank-day">+ Blank day</button>
+    <button class="btn danger" id="cancel-add">Cancel</button>
+  </div>`;
+  document.body.appendChild(el);
+  $$('.tmpl-btn', el).forEach((b, i) => b.onclick = () => { addDayFromTemplate(SPLIT[i].key); el.remove(); });
+  $('#blank-day', el).onclick = () => { addBlankDay(); el.remove(); };
+  $('#cancel-add', el).onclick = () => el.remove();
+}
+function addDayFromTemplate(tKey) {
+  const tmpl = dayByKey(tKey);
+  const key = newDayKey();
+  state.customDayDefs[key] = { title: tmpl.title, focus: tmpl.focus, accent: tmpl.accent, items: tmpl.items.map(it => ({ ...it })) };
+  state.week.push(key);
+  save(); renderPlanEditor();
+}
+function addBlankDay() {
+  const title = prompt('Day name', 'Custom Day') || 'Custom Day';
+  const palette = ['#4FA3FF', '#5BD168', '#FFA94D', '#FF6B6B', '#B786F5', '#FFD43B', '#3DDBD9'];
+  const key = newDayKey();
+  state.customDayDefs[key] = { title, focus: 'Custom workout', accent: palette[state.week.length % palette.length], items: [] };
+  state.week.push(key);
+  save(); renderPlanEditor();
+}
+
+/* ---------- day exercise editor (swap/add/remove/tune) ---------- */
+function renderDayEditor(key) {
+  const day = planDayDef(key);
+  if (!day) { location.hash = '#/week'; return; }
+  const customized = !!state.customDays[key];
+  const rows = day.items.map((it, i) => {
+    const ex = getEx(it.ex) || {};
+    return `
+    <div class="edit-row">
+      <img class="thumb" src="${ex.gif || ''}" alt="">
+      <div class="card-body">
+        <div class="card-title">${esc(it.label)}</div>
+        <div class="edit-controls">
+          <div class="stepper small"><button class="sets-minus" data-i="${i}">−</button><span>${it.sets} sets</span><button class="sets-plus" data-i="${i}">+</button></div>
+          <input class="reps-input" data-i="${i}" value="${esc(it.reps)}" placeholder="reps">
+        </div>
+      </div>
+      <div class="edit-actions">
+        <button class="icon-btn swap-btn" data-i="${i}" title="Swap exercise">⇄</button>
+        <button class="icon-btn remove-btn" data-i="${i}" title="Remove">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+  view.innerHTML = `
+    <a class="back-link" href="#/day/${key}">‹ Back</a>
+    <div class="screen-head"><h1>Customize ${esc(day.title)}</h1><div class="sub">Changes save automatically</div></div>
+    ${rows || '<div class="empty"><span class="emoji">🗒️</span>No exercises yet — add one below.</div>'}
+    <button class="btn ghost" id="add-ex">+ Add exercise</button>
+    ${customized ? '<button class="btn danger" id="reset-day">Reset to default</button>' : ''}
+    <button class="btn" id="done-edit" style="background:${day.accent}">Done</button>`;
+
+  const mutate = fn => {
+    const items = state.customDays[key] ? state.customDays[key] : day.items.map(it => ({ ...it }));
+    fn(items);
+    state.customDays[key] = items;
+    save(); renderDayEditor(key);
+  };
+
+  $$('.sets-minus').forEach(b => b.onclick = () => mutate(items => { items[+b.dataset.i].sets = Math.max(1, items[+b.dataset.i].sets - 1); }));
+  $$('.sets-plus').forEach(b => b.onclick = () => mutate(items => { items[+b.dataset.i].sets = Math.min(10, items[+b.dataset.i].sets + 1); }));
+  $$('.reps-input').forEach(inp => inp.onchange = () => mutate(items => { items[+inp.dataset.i].reps = inp.value || items[+inp.dataset.i].reps; }));
+  $$('.remove-btn').forEach(b => b.onclick = () => mutate(items => { items.splice(+b.dataset.i, 1); }));
+  $$('.swap-btn').forEach(b => b.onclick = () => {
+    pickCtx = { dayKey: key, index: +b.dataset.i, dayTitle: day.title, returnHash: `#/edit/${key}` };
+    location.hash = '#/pick';
+  });
+  $('#add-ex').onclick = () => {
+    pickCtx = { dayKey: key, index: null, dayTitle: day.title, returnHash: `#/edit/${key}` };
+    location.hash = '#/pick';
+  };
+  const resetBtn = $('#reset-day');
+  if (resetBtn) resetBtn.onclick = () => {
+    if (confirm('Reset this day to its default exercises?')) { delete state.customDays[key]; save(); renderDayEditor(key); }
+  };
+  $('#done-edit').onclick = () => { location.hash = `#/day/${key}`; };
+}
+
+function applyPick(ex) {
+  if (!ex || !pickCtx) return;
+  const { dayKey, index, returnHash } = pickCtx;
+  if (!EXERCISES[ex.id]) {
+    state.customExercises[ex.id] = { name: ex.name, equipment: ex.equipment, target: ex.target, secondary: ex.secondary, steps: ex.steps, gif: ex.gif };
+  }
+  const day = planDayDef(dayKey);
+  const items = state.customDays[dayKey] ? state.customDays[dayKey] : day.items.map(it => ({ ...it }));
+  if (index == null) {
+    items.push({ label: titleCase(ex.name), ex: ex.id, sets: 3, reps: '10-12' });
+  } else {
+    items[index] = { label: titleCase(ex.name), ex: ex.id, sets: items[index].sets, reps: items[index].reps };
+  }
+  state.customDays[dayKey] = items;
+  save();
+  pickCtx = null;
+  location.hash = returnHash;
+}
+
+/* ---------- library tab (all exercises, grouped by muscle) + fuzzy search + picker mode ---------- */
+let libQuery = '';
+function renderLibrary() {
+  const picking = !!pickCtx;
+  view.innerHTML = `
+    ${picking
+      ? `<div class="pick-banner">Choose exercise for <b>${esc(pickCtx.dayTitle)}</b><button id="pick-cancel" class="chip-btn">Cancel</button></div>`
+      : `<div class="screen-head"><h1>Library</h1><div class="sub">Every exercise in the dataset — grouped by muscle</div></div>`}
+    <div class="search-wrap"><input id="lib-search" class="search-input" type="search" inputmode="search" placeholder="Search exercises…" value="${esc(libQuery)}" autocomplete="off"></div>
+    <div id="lib-body"><div class="empty"><span class="emoji">⏳</span>Loading exercise library…</div></div>`;
+  if (picking) $('#pick-cancel').onclick = () => { const h = pickCtx.returnHash; pickCtx = null; location.hash = h; };
+  const input = $('#lib-search');
+  let deb;
+  input.oninput = () => { libQuery = input.value; clearTimeout(deb); deb = setTimeout(renderLibraryBody, 100); };
+  ensureCatalog().then(renderLibraryBody);
+}
+
+function renderLibraryBody() {
+  const body = $('#lib-body');
+  if (!body) return; // navigated away already
+  const all = [...catalogMap.values()];
+  if (!all.length) {
+    body.innerHTML = `<div class="empty"><span class="emoji">📡</span>Couldn't load the library. Check your connection and reopen this tab.</div>`;
+    return;
+  }
+  const q = libQuery.trim();
+  if (q) {
+    const results = fuzzySearch(all, q).slice(0, 50);
+    body.innerHTML = results.length ? results.map(rowHtml).join('') : `<div class="empty"><span class="emoji">🔍</span>No matches for "${esc(q)}".</div>`;
+  } else {
+    const groups = {};
+    all.forEach(e => { (groups[e.group] || (groups[e.group] = [])).push(e); });
+    const order = [...GROUP_ORDER.filter(g => groups[g]), ...Object.keys(groups).filter(g => !GROUP_ORDER.includes(g)).sort()];
+    body.innerHTML = order.map(g => `
+      <details class="lib-group">
+        <summary>${titleCase(g)} <span class="count">${groups[g].length}</span></summary>
+        ${groups[g].map(rowHtml).join('')}
+      </details>`).join('');
+  }
+  $$('.lib-row', body).forEach(row => row.onclick = () => {
+    const id = row.dataset.id;
+    if (pickCtx) applyPick(catalogMap.get(id));
+    else location.hash = `#/ex/${id}`;
+  });
+}
+function rowHtml(e) {
+  return `<div class="card lib-row" data-id="${e.id}">
+    <img class="thumb" src="${e.gif}" alt="" loading="lazy">
+    <div class="card-body">
+      <div class="card-title" style="text-transform:capitalize">${esc(e.name)}</div>
+      <div class="card-meta">${esc(e.equipment)} · ${esc(e.target)}</div>
+    </div>
+    <span class="chev">›</span>
+  </div>`;
 }
 
 /* ---------- exercise detail ---------- */
 function renderExercise(id) {
-  const ex = EXERCISES[id];
-  if (!ex) { location.hash = '#/'; return; }
+  const ex = getEx(id);
+  if (ex) { renderExerciseDetail(ex); return; }
+  view.innerHTML = `<a class="back-link" href="javascript:history.back()">‹ Back</a><div class="empty"><span class="emoji">⏳</span>Loading exercise…</div>`;
+  ensureCatalog().then(() => {
+    if (!location.hash.endsWith('/ex/' + id)) return; // navigated away while loading
+    const ex2 = getEx(id);
+    if (ex2) renderExerciseDetail(ex2);
+    else view.innerHTML = `<a class="back-link" href="javascript:history.back()">‹ Back</a><div class="empty"><span class="emoji">🤷</span>Exercise not found.</div>`;
+  });
+}
+function renderExerciseDetail(ex) {
   view.innerHTML = `
     <a class="back-link" href="javascript:history.back()">‹ Back</a>
     <img class="detail-gif" src="${ex.gif}" alt="${esc(ex.name)}">
     <div class="chips">
       <span class="chip">${esc(ex.equipment)}</span>
       <span class="chip">${esc(ex.target)}</span>
-      ${[...new Set(ex.secondary)].slice(0, 3).map(m => `<span class="chip">${esc(m)}</span>`).join('')}
+      ${[...new Set(ex.secondary || [])].slice(0, 3).map(m => `<span class="chip">${esc(m)}</span>`).join('')}
     </div>
     <div class="screen-head" style="text-align:center;margin-top:6px">
       <h1 style="font-size:20px;text-transform:capitalize">${esc(ex.name)}</h1>
     </div>
     <div class="steps">
-      ${ex.steps.map((s, i) => `<div class="step"><b>${i + 1}</b><span>${esc(s)}</span></div>`).join('')}
+      ${(ex.steps || []).map((s, i) => `<div class="step"><b>${i + 1}</b><span>${esc(s)}</span></div>`).join('')}
     </div>`;
 }
 
 /* ---------- session tracking ---------- */
 function startSession(dayKey) {
-  const day = dayByKey(dayKey);
+  const day = planDayDef(dayKey);
   const sets = day.items.map(it => {
     const prev = lastSets(it.ex);
     return Array.from({ length: it.sets }, (_, i) => ({
@@ -180,11 +534,11 @@ function startSession(dayKey) {
 function renderSession() {
   const a = state.active;
   if (!a) { location.hash = '#/'; return; }
-  const day = dayByKey(a.day);
+  const day = planDayDef(a.day);
   requestWakeLock();
 
   const blocks = day.items.map((it, i) => {
-    const ex = EXERCISES[it.ex];
+    const ex = getEx(it.ex) || {};
     const hint = progressionHint(it);
     const rows = a.sets[i].map((s, j) => `
       <div class="set-row ${s.done ? 'done' : ''}" data-i="${i}" data-j="${j}">
@@ -199,7 +553,7 @@ function renderSession() {
     return `
       <div class="session-ex">
         <div class="session-ex-head" data-ex="${it.ex}">
-          <img class="thumb" src="${ex.gif}" alt="">
+          <img class="thumb" src="${ex.gif || ''}" alt="">
           <div class="card-body">
             <div class="card-title">${esc(it.label)}</div>
             <div class="card-meta">${it.sets} × ${esc(it.reps)}${it.time ? '' : ' · tap for form'}</div>
@@ -267,7 +621,7 @@ function renderSession() {
 
 function finishSession() {
   const a = state.active;
-  const day = dayByKey(a.day);
+  const day = planDayDef(a.day);
   const log = [];
   day.items.forEach((it, i) => a.sets[i].forEach(s => {
     if (s.done) log.push({ ex: it.ex, label: it.label, w: +s.w || 0, r: +s.r || 0, time: !!it.time });
@@ -316,7 +670,7 @@ function renderHistory() {
   const cards = [...state.sessions].reverse().map(s => {
     const volume = s.log.filter(l => !l.time).reduce((t, l) => t + l.w * l.r, 0);
     const mins = Math.max(1, Math.round((s.endedAt - s.startedAt) / 60000));
-    const d = dayByKey(s.day);
+    const d = planDayDef(s.day);
     return `
       <div class="card hist-card" style="border-left:4px solid ${d ? d.accent : '#666'}">
         <div class="card-body">
@@ -350,12 +704,13 @@ function renderSettings() {
         <button id="rest-plus-set">+</button>
       </div>
     </div>
+    ${deferredInstallPrompt ? '<button class="btn ghost" id="install-settings-btn">📲 Install app</button>' : ''}
     <button class="btn ghost" id="export">Export data (JSON backup)</button>
     <button class="btn ghost" id="import">Import backup</button>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
     <button class="btn danger" id="wipe">Clear all data</button>
     <p class="about">
-      <b>Gym Buddy</b> — your 6-day split, offline.<br>
+      <b>Gym Buddy</b> — your workout plan, offline.<br>
       Exercise illustrations & instructions from
       <a href="https://github.com/hasaneyldrm/exercises-dataset" target="_blank" rel="noopener">hasaneyldrm/exercises-dataset</a>,
       used for educational, non-commercial purposes.<br>
@@ -367,6 +722,8 @@ function renderSettings() {
   };
   $('#rest-minus').onclick = () => bump(-15);
   $('#rest-plus-set').onclick = () => bump(15);
+  const installBtn = $('#install-settings-btn');
+  if (installBtn) installBtn.onclick = doInstall;
   $('#export').onclick = () => {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -381,7 +738,9 @@ function renderSettings() {
     file.text().then(t => {
       const s = JSON.parse(t);
       if (s && s.v === 1 && Array.isArray(s.sessions)) {
-        state = s; save(); alert('Backup restored ✔'); render();
+        localStorage.setItem(STORE_KEY, JSON.stringify(s));
+        state = load(); // backfills defaults for any fields missing from an older backup
+        alert('Backup restored ✔'); render();
       } else alert('Not a valid Gym Buddy backup.');
     }).catch(() => alert('Could not read that file.'));
   };
@@ -431,7 +790,6 @@ function beep() {
     osc.onended = () => ctx.close();
   } catch (e) { /* audio not available */ }
 }
-function stopTicker() { /* view changed — rest bar persists across views on purpose */ }
 
 /* ---------- wake lock (screen stays on during a session) ---------- */
 let wakeLock = null;
@@ -444,3 +802,53 @@ function releaseWakeLock() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.active && location.hash.startsWith('#/session')) requestWakeLock();
 });
+
+/* ---------- install prompt (native-app behavior) ---------- */
+let deferredInstallPrompt = null;
+function isStandalone() { return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true; }
+function isIOS() { return /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream; }
+
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  maybeShowInstallBanner();
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  hideInstallBanner();
+  state.installDismissedAt = 'installed'; save();
+});
+window.addEventListener('load', () => setTimeout(maybeShowInstallBanner, 1500));
+
+function maybeShowInstallBanner() {
+  if (isStandalone()) return;
+  if (state.installDismissedAt === 'installed') return;
+  if (typeof state.installDismissedAt === 'number' && Date.now() - state.installDismissedAt < 14 * 864e5) return;
+  if (!deferredInstallPrompt && !isIOS()) return;
+  showInstallBanner();
+}
+function showInstallBanner() {
+  if ($('#install-banner')) return;
+  const el = document.createElement('div');
+  el.id = 'install-banner';
+  el.className = 'install-banner';
+  if (deferredInstallPrompt) {
+    el.innerHTML = `<span>📲 Install Gym Buddy for the full app experience</span>
+      <div class="install-actions"><button id="install-go" class="chip-btn accent">Install</button><button id="install-dismiss" class="chip-btn">✕</button></div>`;
+  } else if (isIOS()) {
+    el.innerHTML = `<span>📲 Install: tap Share, then "Add to Home Screen"</span>
+      <div class="install-actions"><button id="install-dismiss" class="chip-btn">✕</button></div>`;
+  } else return;
+  document.body.appendChild(el);
+  $('#install-dismiss', el).onclick = () => { state.installDismissedAt = Date.now(); save(); el.remove(); };
+  const goBtn = $('#install-go', el);
+  if (goBtn) goBtn.onclick = () => { el.remove(); doInstall(); };
+}
+function hideInstallBanner() { const el = $('#install-banner'); if (el) el.remove(); }
+async function doInstall() {
+  if (!deferredInstallPrompt) return;
+  deferredInstallPrompt.prompt();
+  const choice = await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  if (choice.outcome !== 'accepted') { state.installDismissedAt = Date.now(); save(); }
+}
