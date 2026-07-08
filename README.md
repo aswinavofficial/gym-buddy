@@ -87,12 +87,16 @@ Legs+Core · Chest+Triceps · Back+Shoulders · Arms+Legs · Rest) that's fully 
   search** — tap any result for its steps and illustration. The full catalog is loaded
   into IndexedDB **lazily** (only the first time you open Library or the exercise
   picker), so first load stays fast.
-- **Set-by-set tracking** (weight × reps) with prefill from your last session, a
-  **rest countdown** (vibration + beep), a screen wake-lock, and a **progression hint**
-  (top of rep range on all sets → +2.5%).
-- **History & backup**: sessions in `localStorage`, JSON export/import.
+- **Set-by-set tracking** (weight × reps, optional RPE) with a **progression engine**
+  that suggests +2.5% after hitting the top of your rep range (or a ~10% deload after
+  missing the bottom), a **rest countdown** with an optional background notification,
+  a screen wake-lock, a **warm-up set generator**, and a **plate calculator**.
+- **Progress tab**: weekly volume, estimated-1RM trend, muscle-balance, and a 12-week
+  consistency heatmap (all pure SVG, no chart library) — plus **personal records** with
+  confetti celebrations, **14 achievements**, a body-weight log, and full session history.
+- **Streaks & weekly goal ring** on the Today view; **kg/lb units**, **CSV/JSON export**.
 - **Install prompt**: proactively offers "Add to Home Screen" so it opens full-screen
-  like a native app (with an iOS Safari fallback hint).
+  like a native app (with an iOS Safari fallback hint and home-screen **shortcuts**).
 - **100% offline** once loaded — the service worker precaches the app shell and the 34
   curated GIFs (~3 MB); the full library's data/media are cached as you browse them.
 
