@@ -1,5 +1,4 @@
-// Generated from hasaneyldrm/exercises-dataset — do not edit by hand.
-// Regenerate with the gen_data.py script (see repo history / README).
+// Generated file — do not edit by hand. Regenerate with the gen_data.py script.
 const SPLIT = [
   {
     "key": "mon",

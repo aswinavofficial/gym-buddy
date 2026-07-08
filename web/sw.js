@@ -1,5 +1,7 @@
-/* Gym Buddy service worker — precache the app shell, serve cache-first (fully offline). */
-const CACHE = 'gymbuddy-v3';
+/* Gym Buddy service worker — precache the app shell, serve cache-first (fully offline).
+   All exercise media is vendored locally in web/media/ — no runtime dependency on the
+   source dataset repo. */
+const CACHE = 'gymbuddy-v4';
 
 const ASSETS = [
   './',
@@ -69,9 +71,9 @@ self.addEventListener('fetch', e => {
     caches.match(e.request, { ignoreSearch: true }).then(hit =>
       hit ||
       fetch(e.request).then(res => {
-        // Cache same-origin responses (catalog.json, any future assets) and cross-origin
-        // GIFs served opaque (no-cors <img> loads to raw.githubusercontent.com) — both are
-        // fetched lazily (catalog / full exercise library), never precached up front.
+        // Cache same-origin responses not in the precache list (catalog.json, the
+        // 1,290 non-curated exercise GIFs) — fetched lazily as the user browses,
+        // never precached up front.
         if (res.ok || res.type === 'opaque') {
           const copy = res.clone();
           caches.open(CACHE).then(c => c.put(e.request, copy));
