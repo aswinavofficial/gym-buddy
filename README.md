@@ -4,6 +4,9 @@ A polished, **offline-first** Android app for browsing **1,324 exercises** and r
 **personalized workout tracker** — built on the open
 [`hasaneyldrm/exercises-dataset`](https://github.com/hasaneyldrm/exercises-dataset).
 
+> **Also in this repo:** [Gym Buddy Web](#gym-buddy-web-pwa) — an installable PWA companion
+> for a fixed 6-day split, deployed to GitHub Pages from [`web/`](web/).
+
 The full exercise catalogue ships **inside the app**, so it works with no network on first
 launch. Animations/thumbnails are cached the first time you view them (kept permanently), and you
 can optionally **download everything (~130 MB) for full offline use**. A built-in updater pulls the
@@ -68,6 +71,27 @@ Requirements: Android SDK 35, JDK 17+.
 
 The debug APK is produced at `app/build/outputs/apk/debug/app-debug.apk`.
 Minimum Android 8.0 (API 26, required by Health Connect), target API 35.
+
+## Gym Buddy Web (PWA)
+
+The [`web/`](web/) folder contains a **zero-build, installable PWA** for a fixed
+**6-day workout split** (Chest+Shoulders · Back+Biceps · Legs+Core · Chest+Triceps ·
+Back+Shoulders · Arms+Legs · Rest), designed to be used *at the gym*:
+
+- **Today view** auto-selects the day's workout; every exercise has an **animated
+  illustration and step-by-step instructions** from the same dataset.
+- **Set-by-set tracking** (weight × reps) with prefill from your last session, a
+  **rest countdown** (vibration + beep), a screen wake-lock, and a **progression hint**
+  (top of rep range on all sets → +2.5%).
+- **History & backup**: sessions in `localStorage`, JSON export/import.
+- **100% offline** once loaded — the service worker precaches the app and all 34 GIFs (~3 MB).
+
+**Live app:** https://aswinavofficial.github.io/gym-buddy/ — open on your phone and
+"Add to Home screen" to run it like a native app.
+
+Deployed automatically on every merge to `main` by
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml). To run locally:
+`cd web && python3 -m http.server 8080`.
 
 ## Attribution
 
