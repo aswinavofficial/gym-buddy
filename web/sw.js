@@ -1,11 +1,13 @@
 /* Gym Buddy service worker — precache the app shell, serve cache-first (fully offline). */
-const CACHE = 'gymbuddy-v2';
+const CACHE = 'gymbuddy-v3';
 
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
   './app.js',
+  './engine.js',
+  './charts.js',
   './data.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
@@ -77,5 +79,15 @@ self.addEventListener('fetch', e => {
         return res;
       })
     )
+  );
+});
+
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+      for (const c of clients) if ('focus' in c) return c.focus();
+      if (self.clients.openWindow) return self.clients.openWindow('./');
+    })
   );
 });

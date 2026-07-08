@@ -1,4 +1,5 @@
-/* Gym Buddy — vanilla JS PWA. State lives in localStorage; full exercise catalog lives in IndexedDB (lazy). */
+/* Gym Buddy — vanilla JS PWA. State lives in localStorage; full exercise catalog lives in IndexedDB (lazy).
+   Domain logic lives in engine.js, chart builders in charts.js (both loaded before this file). */
 'use strict';
 
 const STORE_KEY = 'gymbuddy.v1';
@@ -9,6 +10,7 @@ const GROUP_ORDER = ['chest', 'back', 'shoulders', 'upper arms', 'lower arms', '
 const DEFAULT_WEEK = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
 /* ---------- store ---------- */
+function defaultSettings() { return { restSec: 90, units: 'kg', weeklyGoal: null, rpeEnabled: false, restNotify: false, barKg: 20 }; }
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
@@ -20,18 +22,24 @@ function load() {
       if (!s.customExercises) s.customExercises = {};
       if (!s.nextDayId) s.nextDayId = 1;
       if (s.installDismissedAt === undefined) s.installDismissedAt = null;
+      if (!s.settings) s.settings = defaultSettings();
+      const ds = defaultSettings();
+      for (const k in ds) if (s.settings[k] === undefined) s.settings[k] = ds[k];
+      if (!s.bodyMetrics) s.bodyMetrics = [];
+      if (!s.achievements) s.achievements = {};
       return s;
     }
   } catch (e) { /* corrupted → start fresh */ }
   return {
-    v: 1, sessions: [], active: null, settings: { restSec: 90 },
+    v: 1, sessions: [], active: null, settings: defaultSettings(),
     week: [...DEFAULT_WEEK], startWeekday: 1,
     customDays: {}, customDayDefs: {}, customExercises: {}, nextDayId: 1,
-    installDismissedAt: null,
+    installDismissedAt: null, bodyMetrics: [], achievements: {},
   };
 }
 function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
 let state = load();
+rebuildPRs();
 
 const $ = (sel, el) => (el || document).querySelector(sel);
 const $$ = (sel, el) => [...(el || document).querySelectorAll(sel)];
@@ -61,31 +69,6 @@ function weekdayLabelFor(key) {
   return WD_FULL[(state.startWeekday + idx) % 7];
 }
 function newDayKey() { const k = 'c' + state.nextDayId; state.nextDayId++; return k; }
-
-/* Last logged sets for an exercise across finished sessions (newest first).
-   Session logs only ever contain completed sets. */
-function lastSets(exId) {
-  for (let i = state.sessions.length - 1; i >= 0; i--) {
-    const sets = (state.sessions[i].log || []).filter(l => l.ex === exId);
-    if (sets.length) return sets;
-  }
-  return null;
-}
-
-/* Progression hint per the split's rule: top of rep range on all sets → +2.5%. */
-function progressionHint(item) {
-  const prev = lastSets(item.ex);
-  if (!prev || item.time) return null;
-  const top = parseInt(String(item.reps).split('-').pop(), 10);
-  if (!top) return null;
-  const allTop = prev.every(s => s.r >= top);
-  const w = Math.max(...prev.map(s => s.w || 0));
-  if (allTop && w > 0) {
-    const next = Math.round(w * 1.025 * 2) / 2;
-    return `Hit ${top}+ reps on every set last time — try ${next} kg today`;
-  }
-  return null;
-}
 
 /* ---------- exercise lookup: curated (offline-guaranteed) → plan overrides → full catalog ---------- */
 function getEx(id) { return EXERCISES[id] || state.customExercises[id] || catalogMap.get(id) || null; }
@@ -177,6 +160,12 @@ window.addEventListener('DOMContentLoaded', render);
 let pickCtx = null; // { dayKey, index, dayTitle, returnHash } while the Library is acting as an exercise picker
 
 function render() {
+  if (document.startViewTransition) document.startViewTransition(() => renderRoute());
+  else renderRoute();
+  updateAppBadge();
+}
+
+function renderRoute() {
   const hash = location.hash.replace(/^#\/?/, '');
   const [route, arg] = hash.split('/');
   let nav = 'today';
@@ -184,16 +173,36 @@ function render() {
   else if (route === 'plan') { renderPlanEditor(); nav = 'week'; }
   else if (route === 'library') { pickCtx = null; renderLibrary(); nav = 'library'; }
   else if (route === 'pick') { if (!pickCtx) { location.hash = '#/library'; return; } renderLibrary(); nav = ''; }
-  else if (route === 'history') { renderHistory(); nav = 'history'; }
+  else if (route === 'progress') { renderProgress(); nav = 'progress'; }
   else if (route === 'settings') { renderSettings(); nav = 'settings'; }
   else if (route === 'ex') { renderExercise(arg); nav = ''; }
   else if (route === 'session') { renderSession(); nav = ''; }
   else if (route === 'edit') { renderDayEditor(arg); nav = ''; }
   else if (route === 'day') { renderDay(arg, arg === todayKey()); nav = 'week'; }
   else if (route === 'rest') { renderRest(todayKey() === null); nav = 'today'; }
+  else if (route === 'today-start') {
+    const k = todayKey();
+    if (k) { if (!(state.active && state.active.day === k)) startSession(k); renderSession(); }
+    else renderRest(true);
+    nav = '';
+  }
   else { const k = todayKey(); if (k) renderDay(k, true); else renderRest(true); nav = 'today'; }
   $$('#bottom-nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === nav));
   view.scrollTop = 0; window.scrollTo(0, 0);
+}
+
+/* ---------- stats strip (Today view header) ---------- */
+function statsStripHtml() {
+  const streak = currentStreak();
+  const done = sessionsThisWeek(), goal = weeklyGoal();
+  const pct = goal ? done / goal : 0;
+  return `<div class="stats-strip">
+    <div class="stat-pill">🔥 <b>${streak}</b><span>day streak</span></div>
+    <a class="stat-pill ring-pill" href="#/progress">
+      ${svgRing(pct, { size: 34, stroke: 4 })}
+      <span>${done}/${goal}<br>this week</span>
+    </a>
+  </div>`;
 }
 
 /* ---------- day (today / week detail) ---------- */
@@ -225,6 +234,7 @@ function renderDay(key, isToday) {
       <h1>${esc(day.title)}</h1>
       <div class="sub">${esc(day.focus)} · ${day.items.length} exercises</div>
     </div>
+    ${isToday ? statsStripHtml() : ''}
     ${cards || '<div class="empty"><span class="emoji">🗒️</span>No exercises yet — customize this day to add some.</div>'}
     <a class="btn ghost" href="#/edit/${key}" style="text-align:center;text-decoration:none;color:var(--text);display:block">Customize workout</a>
     <button class="btn" id="start" style="background:${day.accent}" ${day.items.length ? '' : 'disabled'}>${active ? 'Resume workout' : 'Start workout'}</button>`;
@@ -240,6 +250,7 @@ function renderRest(isToday) {
       <div class="eyebrow" style="color:${REST_DAY.accent}">${isToday ? 'Today · ' : ''}Rest Day</div>
       <h1>Rest & Recovery</h1>
     </div>
+    ${isToday ? statsStripHtml() : ''}
     <div class="rest-hero">
       <div class="emoji">🌴</div>
       <h2>Recharge day</h2>
@@ -490,16 +501,16 @@ function rowHtml(e) {
 /* ---------- exercise detail ---------- */
 function renderExercise(id) {
   const ex = getEx(id);
-  if (ex) { renderExerciseDetail(ex); return; }
+  if (ex) { renderExerciseDetail(ex, id); return; }
   view.innerHTML = `<a class="back-link" href="javascript:history.back()">‹ Back</a><div class="empty"><span class="emoji">⏳</span>Loading exercise…</div>`;
   ensureCatalog().then(() => {
     if (!location.hash.endsWith('/ex/' + id)) return; // navigated away while loading
     const ex2 = getEx(id);
-    if (ex2) renderExerciseDetail(ex2);
+    if (ex2) renderExerciseDetail(ex2, id);
     else view.innerHTML = `<a class="back-link" href="javascript:history.back()">‹ Back</a><div class="empty"><span class="emoji">🤷</span>Exercise not found.</div>`;
   });
 }
-function renderExerciseDetail(ex) {
+function renderExerciseDetail(ex, id) {
   view.innerHTML = `
     <a class="back-link" href="javascript:history.back()">‹ Back</a>
     <img class="detail-gif" src="${ex.gif}" alt="${esc(ex.name)}">
@@ -513,16 +524,28 @@ function renderExerciseDetail(ex) {
     </div>
     <div class="steps">
       ${(ex.steps || []).map((s, i) => `<div class="step"><b>${i + 1}</b><span>${esc(s)}</span></div>`).join('')}
-    </div>`;
+    </div>
+    <div id="similar-slot"></div>`;
+  if (id) ensureCatalog().then(() => {
+    if (!location.hash.endsWith('/ex/' + id)) return;
+    const all = [...catalogMap.values()];
+    const similar = all.filter(e => e.id !== id && e.target === ex.target).slice(0, 6);
+    const slot = $('#similar-slot');
+    if (slot && similar.length) {
+      slot.innerHTML = `<div class="section-label">Similar exercises</div>${similar.map(rowHtml).join('')}`;
+      $$('.lib-row', slot).forEach(row => row.onclick = () => { location.hash = `#/ex/${row.dataset.id}`; });
+    }
+  });
 }
 
 /* ---------- session tracking ---------- */
 function startSession(dayKey) {
   const day = planDayDef(dayKey);
   const sets = day.items.map(it => {
+    const prog = progressionFor(it);
     const prev = lastSets(it.ex);
     return Array.from({ length: it.sets }, (_, i) => ({
-      w: prev && prev[i] ? prev[i].w : (prev ? prev[prev.length - 1].w : ''),
+      w: prog ? prog.weight : (prev && prev[i] ? prev[i].w : (prev ? prev[prev.length - 1].w : '')),
       r: '',
       done: false,
     }));
@@ -539,17 +562,21 @@ function renderSession() {
 
   const blocks = day.items.map((it, i) => {
     const ex = getEx(it.ex) || {};
-    const hint = progressionHint(it);
+    const prog = progressionFor(it);
+    const hasWarmup = a.sets[i].some(s => s.warmup);
+    const showRpe = state.settings.rpeEnabled && !it.time;
     const rows = a.sets[i].map((s, j) => `
-      <div class="set-row ${s.done ? 'done' : ''}" data-i="${i}" data-j="${j}">
-        <div class="set-num">${j + 1}</div>
+      <div class="set-row ${showRpe ? 'has-rpe' : ''} ${s.done ? 'done' : ''} ${s.warmup ? 'warmup' : ''}" data-i="${i}" data-j="${j}">
+        <div class="set-num">${s.warmup ? 'W' : j - a.sets[i].filter(x => x.warmup).length + 1}</div>
         ${it.time
           ? `<input class="set-input" data-f="r" type="number" inputmode="numeric" placeholder="sec" value="${s.r}">
              <div class="set-num">—</div>`
-          : `<input class="set-input" data-f="w" type="number" inputmode="decimal" step="0.5" placeholder="kg" value="${s.w}">
+          : `<div class="w-input-wrap"><input class="set-input" data-f="w" type="number" inputmode="decimal" step="0.5" placeholder="${unitLabel()}" value="${kgToDisp(s.w)}"><button class="plate-btn" data-i="${i}" data-j="${j}" title="Plate calculator">🏋️</button></div>
              <input class="set-input" data-f="r" type="number" inputmode="numeric" placeholder="${esc(it.reps)}" value="${s.r}">`}
+        ${showRpe ? `<select class="rpe-select" data-i="${i}" data-j="${j}"><option value="">RPE</option>${[6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10].map(v => `<option value="${v}" ${s.rpe === v ? 'selected' : ''}>${v}</option>`).join('')}</select>` : ''}
         <button class="set-check ${s.done ? 'on' : ''}" aria-label="done">✓</button>
       </div>`).join('');
+    const hint = prog && prog.hint;
     return `
       <div class="session-ex">
         <div class="session-ex-head" data-ex="${it.ex}">
@@ -560,11 +587,12 @@ function renderSession() {
           </div>
           <span class="chev">›</span>
         </div>
-        ${hint ? `<div class="hint">📈 ${hint}</div>` : ''}
+        ${hint ? `<div class="hint ${prog.type === 'deload' ? 'hint-deload' : ''}">${prog.type === 'deload' ? '⚠️' : '📈'} ${esc(hint)}</div>` : ''}
         <div class="set-rows">
-          <div class="set-head-row"><span>#</span><span>${it.time ? 'seconds' : 'kg'}</span><span>${it.time ? '' : 'reps'}</span><span>done</span></div>
+          <div class="set-head-row ${showRpe ? 'has-rpe' : ''}"><span>#</span><span>${it.time ? 'seconds' : unitLabel()}</span><span>${it.time ? '' : 'reps'}</span>${showRpe ? '<span>rpe</span>' : ''}<span>done</span></div>
           ${rows}
         </div>
+        ${!it.time && !hasWarmup ? `<button class="btn ghost warmup-btn" data-i="${i}" style="margin:0 14px 12px;width:calc(100% - 28px)">+ Warm-up sets</button>` : ''}
       </div>`;
   }).join('');
 
@@ -587,8 +615,27 @@ function renderSession() {
   $$('.set-input').forEach(inp => inp.onchange = () => {
     const row = inp.closest('.set-row');
     const s = a.sets[+row.dataset.i][+row.dataset.j];
-    s[inp.dataset.f] = inp.value === '' ? '' : +inp.value;
+    if (inp.dataset.f === 'w') s.w = inp.value === '' ? '' : dispToKg(+inp.value);
+    else s.r = inp.value === '' ? '' : +inp.value;
     save();
+  });
+  $$('.rpe-select').forEach(sel => sel.onchange = () => {
+    a.sets[+sel.dataset.i][+sel.dataset.j].rpe = sel.value === '' ? undefined : +sel.value;
+    save();
+  });
+  $$('.plate-btn').forEach(btn => btn.onclick = () => {
+    const row = btn.closest('.set-row');
+    const inp = row.querySelector('[data-f="w"]');
+    showPlateModal(+inp.value || 0);
+  });
+  $$('.warmup-btn').forEach(btn => btn.onclick = () => {
+    const i = +btn.dataset.i;
+    const working = a.sets[i].find(s => s.w) || {};
+    if (!working.w) { alert('Enter a working weight first, then add warm-ups.'); return; }
+    const pct = [[0.4, 10], [0.6, 6], [0.8, 3]];
+    const warm = pct.map(([p, reps]) => ({ w: roundToStep(working.w * p), r: reps, done: false, warmup: true }));
+    a.sets[i] = [...warm, ...a.sets[i]];
+    save(); renderSession();
   });
   $$('.set-check').forEach(btn => btn.onclick = () => {
     const row = btn.closest('.set-row');
@@ -596,11 +643,13 @@ function renderSession() {
     const s = a.sets[i][j];
     s.done = !s.done;
     if (s.done) {
-      // default reps to bottom of target range if left empty
       if (s.r === '' || s.r == null) {
         const it = day.items[i];
         s.r = parseInt(String(it.reps), 10) || 0;
         row.querySelector('[data-f="r"]').value = s.r;
+      }
+      if (!s.warmup && s.w && updatePRFromSet(day.items[i].ex, s.w, s.r, Date.now())) {
+        celebratePR();
       }
       startRest();
       if (navigator.vibrate) navigator.vibrate(30);
@@ -614,7 +663,7 @@ function renderSession() {
   $('#finish').onclick = finishSession;
   $('#discard').onclick = () => {
     if (confirm('Discard this workout? Logged sets will be lost.')) {
-      state.active = null; save(); stopRest(); location.hash = '#/';
+      state.active = null; save(); stopRest(); rebuildPRs(); location.hash = '#/';
     }
   };
 }
@@ -624,20 +673,19 @@ function finishSession() {
   const day = planDayDef(a.day);
   const log = [];
   day.items.forEach((it, i) => a.sets[i].forEach(s => {
-    if (s.done) log.push({ ex: it.ex, label: it.label, w: +s.w || 0, r: +s.r || 0, time: !!it.time });
+    if (s.done && !s.warmup) log.push({ ex: it.ex, label: it.label, w: +s.w || 0, r: +s.r || 0, time: !!it.time, rpe: s.rpe });
   }));
   if (!log.length && !confirm('No sets completed — finish anyway?')) return;
-  const session = {
-    day: a.day, title: day.title,
-    startedAt: a.startedAt, endedAt: Date.now(), log,
-  };
+  const session = { day: a.day, title: day.title, startedAt: a.startedAt, endedAt: Date.now(), log };
+  session.calories = sessionCalories(session);
   state.sessions.push(session);
   state.active = null;
   save(); stopRest(); releaseWakeLock();
-  showSummary(session, day);
+  const unlocked = checkAchievements(session);
+  showSummary(session, day, unlocked);
 }
 
-function showSummary(s, day) {
+function showSummary(s, day, unlocked) {
   const volume = s.log.filter(l => !l.time).reduce((t, l) => t + l.w * l.r, 0);
   const mins = Math.max(1, Math.round((s.endedAt - s.startedAt) / 60000));
   const el = document.createElement('div');
@@ -649,47 +697,198 @@ function showSummary(s, day) {
       <div class="sub">${esc(day.title)}</div>
       <div class="stats">
         <div><b>${s.log.length}</b><span>sets</span></div>
-        <div><b>${Math.round(volume)}</b><span>kg volume</span></div>
+        <div><b>${Math.round(kgToDisp(volume))}</b><span>${unitLabel()} volume</span></div>
+        <div><b>${s.calories || 0}</b><span>kcal</span></div>
         <div><b>${mins}</b><span>min</span></div>
       </div>
-      <button class="btn" id="close-sum">Done</button>
+      ${unlocked && unlocked.length ? `<div class="unlock-list">${unlocked.map(u => `<div class="unlock-row">${u.emoji} Achievement unlocked: <b>${esc(u.name)}</b></div>`).join('')}</div>` : ''}
+      <button class="btn" id="share-sum">Share</button>
+      <button class="btn ghost" id="close-sum">Done</button>
     </div>`;
   document.body.appendChild(el);
-  $('#close-sum', el).onclick = () => { el.remove(); location.hash = '#/history'; };
+  $('#close-sum', el).onclick = () => { el.remove(); location.hash = '#/progress'; };
+  $('#share-sum', el).onclick = () => shareSummary(s, day, mins);
   if (navigator.vibrate) navigator.vibrate([60, 60, 120]);
+  confettiBurst();
+  unlocked.forEach(u => queueToast(`Achievement: ${u.name}`, u.emoji));
 }
 
-/* ---------- history ---------- */
-function renderHistory() {
-  if (!state.sessions.length) {
-    view.innerHTML = `<div class="screen-head"><h1>History</h1></div>
-      <div class="empty"><span class="emoji">🏋️</span>No workouts yet.<br>Finish your first session and it lands here.</div>`;
-    return;
+async function shareSummary(s, day, mins) {
+  const volume = Math.round(kgToDisp(s.log.filter(l => !l.time).reduce((t, l) => t + l.w * l.r, 0)));
+  const text = `💪 ${day.title}\n${s.log.length} sets · ${volume} ${unitLabel()} volume · ${s.calories || 0} kcal · ${mins} min\n🔥 ${currentStreak()} day streak — Gym Buddy`;
+  try {
+    if (navigator.share) { await navigator.share({ title: 'Gym Buddy workout', text }); return; }
+  } catch (e) { /* user cancelled or unsupported — fall through to clipboard */ }
+  try { await navigator.clipboard.writeText(text); queueToast('Summary copied to clipboard', '📋'); }
+  catch (e) { alert(text); }
+}
+
+/* ---------- progress tab (charts, PRs, achievements, body weight, session history) ---------- */
+function renderProgress() {
+  const streak = currentStreak();
+  const doneWk = sessionsThisWeek(), goal = weeklyGoal();
+
+  // weekly volume, last 8 weeks
+  const weekLabels = [], weekVols = [];
+  for (let i = 7; i >= 0; i--) {
+    const start = weekWindowStart() - i * 7 * 864e5;
+    const end = start + 7 * 864e5;
+    const vol = state.sessions.filter(s => s.endedAt >= start && s.endedAt < end)
+      .reduce((t, s) => t + s.log.filter(l => !l.time).reduce((tt, l) => tt + l.w * l.r, 0), 0);
+    weekVols.push(Math.round(kgToDisp(vol)));
+    weekLabels.push(i === 0 ? 'This' : `-${i}w`);
   }
+
+  // muscle balance this week
+  const start = weekWindowStart();
+  const muscleCounts = {};
+  state.sessions.filter(s => s.endedAt >= start).forEach(s => s.log.forEach(l => {
+    const g = (getEx(l.ex) || {}).target || 'other';
+    muscleCounts[g] = (muscleCounts[g] || 0) + 1;
+  }));
+  const muscleEntries = Object.entries(muscleCounts).sort((a, b) => b[1] - a[1]).slice(0, 6);
+
+  // streak heatmap
+  const dayCounts = {};
+  state.sessions.forEach(s => { const k = new Date(s.endedAt).toDateString(); dayCounts[k] = (dayCounts[k] || 0) + 1; });
+
+  // 1RM trend for most-logged exercise
+  const exCounts = {};
+  state.sessions.forEach(s => s.log.forEach(l => { if (!l.time) exCounts[l.ex] = (exCounts[l.ex] || 0) + 1; }));
+  const topExId = Object.entries(exCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
+  let rmChartHtml = '<div class="empty small"><span class="emoji">📉</span>Log a few sessions to see 1RM trends.</div>';
+  if (topExId) {
+    const points = state.sessions
+      .filter(s => s.log.some(l => l.ex === topExId))
+      .map(s => {
+        const best = Math.max(...s.log.filter(l => l.ex === topExId).map(l => oneRM(l.w, l.r)));
+        return { y: Math.round(kgToDisp(best)), label: new Date(s.endedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) };
+      });
+    const exName = (getEx(topExId) || {}).name || topExId;
+    rmChartHtml = `<div class="chart-title">${esc(titleCase(exName))} — est. 1RM (${unitLabel()})</div>${svgLineChart(points)}`;
+  }
+
+  // PR list
+  const prEntries = Object.entries(prMap).sort((a, b) => b[1].achievedAt - a[1].achievedAt).slice(0, 12);
+  const prHtml = prEntries.length ? prEntries.map(([id, pr]) => `
+    <div class="card">
+      <div class="card-body">
+        <div class="card-title" style="text-transform:capitalize">${esc(titleCase((getEx(id) || {}).name || id))}</div>
+        <div class="card-meta">Best ${round1(kgToDisp(pr.bestWeight))} ${unitLabel()} · est. 1RM ${Math.round(kgToDisp(pr.bestOneRm))} ${unitLabel()}</div>
+      </div>
+    </div>`).join('') : `<div class="empty small"><span class="emoji">🏆</span>No PRs yet — log a session to start tracking.</div>`;
+
+  // achievements grid
+  const achHtml = ACHIEVEMENTS.map(a => {
+    const unlocked = !!state.achievements[a.id];
+    return `<div class="badge ${unlocked ? '' : 'locked'}" title="${esc(a.name)}"><span class="badge-emoji">${a.emoji}</span><span class="badge-name">${esc(a.name)}</span></div>`;
+  }).join('');
+
+  // body weight trend
+  const bwPoints = state.bodyMetrics.slice(-12).map(m => ({ y: round1(kgToDisp(m.kg)), label: new Date(m.ts).toLocaleDateString() }));
+  const bwChart = bwPoints.length >= 2 ? svgLineChart(bwPoints, { color: 'var(--success)' }) : `<div class="empty small"><span class="emoji">⚖️</span>Log your weight to see a trend.</div>`;
+
+  // session history
   const fmt = ts => new Date(ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-  const cards = [...state.sessions].reverse().map(s => {
+  const histHtml = state.sessions.length ? [...state.sessions].reverse().slice(0, 30).map(s => {
     const volume = s.log.filter(l => !l.time).reduce((t, l) => t + l.w * l.r, 0);
     const mins = Math.max(1, Math.round((s.endedAt - s.startedAt) / 60000));
     const d = planDayDef(s.day);
-    return `
-      <div class="card hist-card" style="border-left:4px solid ${d ? d.accent : '#666'}">
-        <div class="card-body">
-          <div class="hist-top">
-            <span class="hist-title">${esc(s.title)}</span>
-            <span class="hist-date">${fmt(s.endedAt)}</span>
-          </div>
-          <div class="hist-stats">
-            <span><b>${s.log.length}</b> sets</span>
-            <span><b>${Math.round(volume)}</b> kg volume</span>
-            <span><b>${mins}</b> min</span>
-          </div>
+    return `<div class="card hist-card" style="border-left:4px solid ${d ? d.accent : '#666'}">
+      <div class="card-body">
+        <div class="hist-top"><span class="hist-title">${esc(s.title)}</span><span class="hist-date">${fmt(s.endedAt)}</span></div>
+        <div class="hist-stats">
+          <span><b>${s.log.length}</b> sets</span>
+          <span><b>${Math.round(kgToDisp(volume))}</b> ${unitLabel()}</span>
+          <span><b>${s.calories || 0}</b> kcal</span>
+          <span><b>${mins}</b> min</span>
         </div>
-      </div>`;
-  }).join('');
-  const week = state.sessions.filter(s => Date.now() - s.endedAt < 7 * 864e5).length;
+      </div>
+    </div>`;
+  }).join('') : `<div class="empty small"><span class="emoji">🏋️</span>No workouts yet.</div>`;
+
   view.innerHTML = `
-    <div class="screen-head"><h1>History</h1>
-    <div class="sub">${state.sessions.length} workouts · ${week} in the last 7 days</div></div>${cards}`;
+    <div class="screen-head"><h1>Progress</h1></div>
+    <div class="stats-strip">
+      <div class="stat-pill">🔥 <b>${streak}</b><span>day streak</span></div>
+      <div class="stat-pill ring-pill">${svgRing(goal ? doneWk / goal : 0, { size: 34, stroke: 4 })}<span>${doneWk}/${goal}<br>this week</span></div>
+    </div>
+
+    <div class="section-label">Weekly volume (${unitLabel()})</div>
+    <div class="chart-card">${svgBarChart(weekLabels, weekVols)}</div>
+
+    <div class="section-label">Est. 1RM trend</div>
+    <div class="chart-card">${rmChartHtml}</div>
+
+    ${muscleEntries.length ? `<div class="section-label">Muscle balance this week</div>
+    <div class="chart-card">${svgBarChart(muscleEntries.map(e => titleCase(e[0]).slice(0, 6)), muscleEntries.map(e => e[1]))}</div>` : ''}
+
+    <div class="section-label">Consistency (12 weeks)</div>
+    <div class="chart-card heatmap-wrap">${svgHeatmap(12, dayCounts)}</div>
+
+    <div class="section-label">Body weight</div>
+    <div class="chart-card">${bwChart}</div>
+    <button class="btn ghost" id="log-weight">+ Log weight</button>
+
+    <div class="section-label">Personal records</div>
+    ${prHtml}
+
+    <div class="section-label">Achievements</div>
+    <div class="badge-grid">${achHtml}</div>
+
+    <div class="section-label">History</div>
+    ${histHtml}`;
+
+  $('#log-weight').onclick = showLogWeightModal;
+}
+
+function showLogWeightModal() {
+  const el = document.createElement('div');
+  el.className = 'overlay';
+  const current = state.bodyMetrics.length ? round1(kgToDisp(state.bodyMetrics[state.bodyMetrics.length - 1].kg)) : '';
+  el.innerHTML = `<div class="modal">
+    <h2>Log body weight</h2>
+    <input id="weight-input" class="search-input" type="number" inputmode="decimal" step="0.1" placeholder="Weight in ${unitLabel()}" value="${current}" style="text-align:center;margin:16px 0">
+    <button class="btn" id="save-weight">Save</button>
+    <button class="btn ghost" id="cancel-weight">Cancel</button>
+  </div>`;
+  document.body.appendChild(el);
+  $('#weight-input', el).focus();
+  $('#cancel-weight', el).onclick = () => el.remove();
+  $('#save-weight', el).onclick = () => {
+    const v = +$('#weight-input', el).value;
+    if (!v || v <= 0) { alert('Enter a valid weight.'); return; }
+    state.bodyMetrics.push({ ts: Date.now(), kg: dispToKg(v) });
+    save(); el.remove(); renderProgress();
+  };
+}
+
+/* ---------- plate calculator ---------- */
+function showPlateModal(currentDisp) {
+  const el = document.createElement('div');
+  el.className = 'overlay';
+  const renderPlateResult = () => {
+    const bar = +$('#bar-input', el).value || state.settings.barKg;
+    const target = +$('#target-input', el).value || currentDisp;
+    const { plates, warning } = calcPlates(target, bar);
+    $('#plate-result', el).innerHTML = plates.length
+      ? `<div class="plate-list">${plates.map(p => `<span class="plate-chip">${p}</span>`).join(' + ')}</div><div class="plate-note">per side</div>`
+      : `<div class="plate-note">Just the bar.</div>`;
+    $('#plate-warning', el).textContent = warning || '';
+  };
+  el.innerHTML = `<div class="modal">
+    <h2>🏋️ Plate calculator</h2>
+    <div class="plate-row"><label>Target (${unitLabel()})</label><input id="target-input" class="search-input" type="number" value="${currentDisp || ''}"></div>
+    <div class="plate-row"><label>Bar (${unitLabel()})</label><input id="bar-input" class="search-input" type="number" value="${kgToDisp(state.settings.barKg)}"></div>
+    <div id="plate-result" style="margin:14px 0"></div>
+    <div id="plate-warning" class="hint-deload" style="text-align:center"></div>
+    <button class="btn ghost" id="close-plate">Close</button>
+  </div>`;
+  document.body.appendChild(el);
+  $('#target-input', el).oninput = renderPlateResult;
+  $('#bar-input', el).oninput = () => { state.settings.barKg = dispToKg(+$('#bar-input', el).value || 20); save(); renderPlateResult(); };
+  $('#close-plate', el).onclick = () => el.remove();
+  renderPlateResult();
 }
 
 /* ---------- settings ---------- */
@@ -704,8 +903,29 @@ function renderSettings() {
         <button id="rest-plus-set">+</button>
       </div>
     </div>
+    <div class="setting-row">
+      <div><div class="lab">Units</div><div class="desc">Weight display &amp; input</div></div>
+      <div class="chip-row" style="margin:0"><button class="wd-chip unit-chip ${state.settings.units === 'kg' ? 'on' : ''}" data-u="kg">kg</button><button class="wd-chip unit-chip ${state.settings.units === 'lb' ? 'on' : ''}" data-u="lb">lb</button></div>
+    </div>
+    <div class="setting-row">
+      <div><div class="lab">Weekly goal</div><div class="desc">Sessions per week (default: plan's training days)</div></div>
+      <div class="stepper">
+        <button id="goal-minus">−</button>
+        <span id="goal-val">${weeklyGoal()}</span>
+        <button id="goal-plus">+</button>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div><div class="lab">Log RPE</div><div class="desc">Rate of perceived exertion per set</div></div>
+      <label class="switch"><input type="checkbox" id="rpe-toggle" ${state.settings.rpeEnabled ? 'checked' : ''}><span class="switch-track"></span></label>
+    </div>
+    <div class="setting-row">
+      <div><div class="lab">Rest-end notification</div><div class="desc">Notify when the timer ends (tab in background)</div></div>
+      <label class="switch"><input type="checkbox" id="notify-toggle" ${state.settings.restNotify ? 'checked' : ''}><span class="switch-track"></span></label>
+    </div>
     ${deferredInstallPrompt ? '<button class="btn ghost" id="install-settings-btn">📲 Install app</button>' : ''}
     <button class="btn ghost" id="export">Export data (JSON backup)</button>
+    <button class="btn ghost" id="export-csv">Export history (CSV)</button>
     <button class="btn ghost" id="import">Import backup</button>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
     <button class="btn danger" id="wipe">Clear all data</button>
@@ -714,7 +934,8 @@ function renderSettings() {
       Exercise illustrations & instructions from
       <a href="https://github.com/hasaneyldrm/exercises-dataset" target="_blank" rel="noopener">hasaneyldrm/exercises-dataset</a>,
       used for educational, non-commercial purposes.<br>
-      Progression: hit the top of the rep range on all sets with good form → increase weight 2.5–5% next session.
+      Progression: hit the top of the rep range on all sets with good form → increase weight ~2.5% next session; miss the bottom of the range → deload ~10%.<br>
+      Calorie figures are MET-based estimates.
     </p>`;
   const bump = d => {
     state.settings.restSec = Math.min(300, Math.max(15, state.settings.restSec + d));
@@ -722,6 +943,18 @@ function renderSettings() {
   };
   $('#rest-minus').onclick = () => bump(-15);
   $('#rest-plus-set').onclick = () => bump(15);
+  $$('.unit-chip').forEach(b => b.onclick = () => { state.settings.units = b.dataset.u; save(); renderSettings(); });
+  $('#goal-minus').onclick = () => { state.settings.weeklyGoal = Math.max(1, weeklyGoal() - 1); save(); $('#goal-val').textContent = weeklyGoal(); };
+  $('#goal-plus').onclick = () => { state.settings.weeklyGoal = Math.min(14, weeklyGoal() + 1); save(); $('#goal-val').textContent = weeklyGoal(); };
+  $('#rpe-toggle').onchange = e => { state.settings.rpeEnabled = e.target.checked; save(); };
+  $('#notify-toggle').onchange = async e => {
+    if (e.target.checked && 'Notification' in window) {
+      const perm = await Notification.requestPermission();
+      state.settings.restNotify = perm === 'granted';
+      e.target.checked = state.settings.restNotify;
+    } else state.settings.restNotify = false;
+    save();
+  };
   const installBtn = $('#install-settings-btn');
   if (installBtn) installBtn.onclick = doInstall;
   $('#export').onclick = () => {
@@ -729,6 +962,13 @@ function renderSettings() {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `gymbuddy-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click(); URL.revokeObjectURL(a.href);
+  };
+  $('#export-csv').onclick = () => {
+    const blob = new Blob([toCSV()], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `gymbuddy-history-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click(); URL.revokeObjectURL(a.href);
   };
   $('#import').onclick = () => $('#import-file').click();
@@ -740,13 +980,14 @@ function renderSettings() {
       if (s && s.v === 1 && Array.isArray(s.sessions)) {
         localStorage.setItem(STORE_KEY, JSON.stringify(s));
         state = load(); // backfills defaults for any fields missing from an older backup
+        rebuildPRs();
         alert('Backup restored ✔'); render();
       } else alert('Not a valid Gym Buddy backup.');
     }).catch(() => alert('Could not read that file.'));
   };
   $('#wipe').onclick = () => {
     if (confirm('Delete ALL workout history and settings?')) {
-      localStorage.removeItem(STORE_KEY); state = load(); render();
+      localStorage.removeItem(STORE_KEY); state = load(); rebuildPRs(); render();
     }
   };
 }
@@ -775,6 +1016,11 @@ function tickRest() {
     stopRest();
     if (navigator.vibrate) navigator.vibrate([120, 80, 120]);
     beep();
+    if (state.settings.restNotify && document.visibilityState === 'hidden' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.ready.then(reg => reg.showNotification('Rest over 💪', {
+        body: 'Back to it — next set is ready.', icon: 'icons/icon-192.png', tag: 'gymbuddy-rest',
+      })).catch(() => {});
+    }
   }
 }
 $('#rest-skip').onclick = stopRest;
@@ -802,6 +1048,76 @@ function releaseWakeLock() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.active && location.hash.startsWith('#/session')) requestWakeLock();
 });
+
+/* ---------- toasts + confetti ---------- */
+let toastQueue = [], toastBusy = false;
+function queueToast(msg, emoji) {
+  toastQueue.push({ msg, emoji });
+  if (!toastBusy) processToastQueue();
+}
+function processToastQueue() {
+  if (!toastQueue.length) { toastBusy = false; return; }
+  toastBusy = true;
+  const { msg, emoji } = toastQueue.shift();
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `<span>${emoji}</span> ${esc(msg)}`;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, 2200);
+  setTimeout(processToastQueue, 1800);
+}
+function celebratePR() {
+  queueToast('New PR!', '🏆');
+  confettiBurst();
+  if (navigator.vibrate) navigator.vibrate([40, 40, 40, 40, 80]);
+}
+function confettiBurst() {
+  const canvas = $('#confetti-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+  canvas.style.width = innerWidth + 'px'; canvas.style.height = innerHeight + 'px';
+  ctx.scale(dpr, dpr);
+  const colors = ['#4FA3FF', '#5BD168', '#FFA94D', '#FF6B6B', '#B786F5', '#FFD43B'];
+  const particles = Array.from({ length: 60 }, () => ({
+    x: innerWidth / 2, y: innerHeight / 3,
+    vx: (Math.random() - 0.5) * 12, vy: (Math.random() - 1.4) * 10,
+    size: 4 + Math.random() * 5, color: colors[Math.floor(Math.random() * colors.length)],
+    rot: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.3, life: 1,
+  }));
+  const start = performance.now();
+  function tick(now) {
+    const dt = Math.min(32, now - (tick.last || now)); tick.last = now;
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    let alive = false;
+    for (const p of particles) {
+      if (p.life <= 0) continue;
+      p.vy += 0.35; p.x += p.vx * (dt / 16); p.y += p.vy * (dt / 16); p.rot += p.vr;
+      p.life -= 0.012;
+      if (p.life > 0) {
+        alive = true;
+        ctx.save(); ctx.globalAlpha = Math.max(0, p.life); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        ctx.fillStyle = p.color; ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+        ctx.restore();
+      }
+    }
+    if (alive && now - start < 2000) requestAnimationFrame(tick);
+    else ctx.clearRect(0, 0, innerWidth, innerHeight);
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ---------- app badge (best-effort, Chromium) ---------- */
+function updateAppBadge() {
+  if (!navigator.setAppBadge) return;
+  const k = todayKey();
+  if (!k) { navigator.clearAppBadge().catch(() => {}); return; }
+  const doneToday = state.sessions.some(s => new Date(s.endedAt).toDateString() === new Date().toDateString());
+  if (doneToday) navigator.clearAppBadge().catch(() => {});
+  else navigator.setAppBadge(1).catch(() => {});
+}
 
 /* ---------- install prompt (native-app behavior) ---------- */
 let deferredInstallPrompt = null;
