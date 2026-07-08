@@ -931,9 +931,7 @@ function renderSettings() {
     <button class="btn danger" id="wipe">Clear all data</button>
     <p class="about">
       <b>Gym Buddy</b> — your workout plan, offline.<br>
-      Exercise illustrations & instructions from
-      <a href="https://github.com/hasaneyldrm/exercises-dataset" target="_blank" rel="noopener">hasaneyldrm/exercises-dataset</a>,
-      used for educational, non-commercial purposes.<br>
+      Exercise illustrations & instructions are used for educational, non-commercial purposes.<br>
       Progression: hit the top of the rep range on all sets with good form → increase weight ~2.5% next session; miss the bottom of the range → deload ~10%.<br>
       Calorie figures are MET-based estimates.
     </p>`;
