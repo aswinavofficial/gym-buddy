@@ -8,6 +8,7 @@ const WD_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const WD_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const GROUP_ORDER = ['chest', 'back', 'shoulders', 'upper arms', 'lower arms', 'upper legs', 'lower legs', 'waist', 'cardio', 'neck'];
 const DEFAULT_WEEK = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const CATALOG_TOTAL = 1324; // exercise count in web/catalog.json — used to label the offline-download button before the catalog loads
 
 /* ---------- store ---------- */
 function defaultSettings() { return { restSec: 90, units: 'kg', weeklyGoal: null, rpeEnabled: false, restNotify: false, barKg: 20 }; }
@@ -27,6 +28,7 @@ function load() {
       for (const k in ds) if (s.settings[k] === undefined) s.settings[k] = ds[k];
       if (!s.bodyMetrics) s.bodyMetrics = [];
       if (!s.achievements) s.achievements = {};
+      if (s.offlineReady === undefined) s.offlineReady = null;
       return s;
     }
   } catch (e) { /* corrupted → start fresh */ }
@@ -34,7 +36,7 @@ function load() {
     v: 1, sessions: [], active: null, settings: defaultSettings(),
     week: [...DEFAULT_WEEK], startWeekday: 1,
     customDays: {}, customDayDefs: {}, customExercises: {}, nextDayId: 1,
-    installDismissedAt: null, bodyMetrics: [], achievements: {},
+    installDismissedAt: null, bodyMetrics: [], achievements: {}, offlineReady: null,
   };
 }
 function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
@@ -923,6 +925,7 @@ function renderSettings() {
       <div><div class="lab">Rest-end notification</div><div class="desc">Notify when the timer ends (tab in background)</div></div>
       <label class="switch"><input type="checkbox" id="notify-toggle" ${state.settings.restNotify ? 'checked' : ''}><span class="switch-track"></span></label>
     </div>
+    ${offlineRowHtml()}
     ${deferredInstallPrompt ? '<button class="btn ghost" id="install-settings-btn">📲 Install app</button>' : ''}
     <button class="btn ghost" id="export">Export data (JSON backup)</button>
     <button class="btn ghost" id="export-csv">Export history (CSV)</button>
@@ -953,6 +956,7 @@ function renderSettings() {
     } else state.settings.restNotify = false;
     save();
   };
+  wireOfflineRow();
   const installBtn = $('#install-settings-btn');
   if (installBtn) installBtn.onclick = doInstall;
   $('#export').onclick = () => {
@@ -988,6 +992,93 @@ function renderSettings() {
       localStorage.removeItem(STORE_KEY); state = load(); rebuildPRs(); render();
     }
   };
+}
+
+/* ---------- offline download ("make available offline" button) ----------
+   Every exercise GIF is same-origin (web/media/*.gif). Fetching a URL that
+   the service worker's fetch handler hasn't cached yet triggers it to
+   cache-on-fetch, exactly like normal lazy browsing — this just does that
+   for the whole catalog up front, with a progress UI, so the app works
+   with zero network afterwards. */
+let downloadState = { active: false, done: 0, total: 0, failed: 0, controller: null };
+
+function offlineRowHtml() {
+  if (downloadState.active) {
+    const pct = downloadState.total ? Math.round((downloadState.done / downloadState.total) * 100) : 0;
+    return `<div class="setting-row" id="offline-row">
+      <div style="flex:1;min-width:0">
+        <div class="lab">Downloading for offline…</div>
+        <div class="progress-bar" style="margin-top:8px"><div class="progress-fill" id="dl-fill" style="width:${pct}%"></div></div>
+        <div class="desc" id="dl-text" style="margin-top:6px">${downloadState.done}/${downloadState.total || CATALOG_TOTAL} · ${pct}%</div>
+      </div>
+      <button class="icon-btn" id="dl-cancel" aria-label="Cancel download">✕</button>
+    </div>`;
+  }
+  if (state.offlineReady) {
+    const when = new Date(state.offlineReady.at).toLocaleDateString();
+    const failNote = state.offlineReady.failed ? ` · ${state.offlineReady.failed} failed, tap to retry` : '';
+    return `<div class="setting-row" id="offline-row">
+      <div><div class="lab">✅ Available offline</div><div class="desc">All ${state.offlineReady.total} exercises downloaded ${when}${failNote}</div></div>
+      <button class="chip-btn" id="dl-start">Re-download</button>
+    </div>`;
+  }
+  return `<div class="setting-row" id="offline-row">
+    <div><div class="lab">Make available offline</div><div class="desc">Download all ${CATALOG_TOTAL} exercise illustrations (~126 MB) so the app works with no internet</div></div>
+    <button class="chip-btn accent" id="dl-start">Download</button>
+  </div>`;
+}
+function wireOfflineRow() {
+  const startBtn = $('#dl-start');
+  if (startBtn) startBtn.onclick = startOfflineDownload;
+  const cancelBtn = $('#dl-cancel');
+  if (cancelBtn) cancelBtn.onclick = cancelOfflineDownload;
+}
+function renderOfflineSection() {
+  const row = $('#offline-row');
+  if (!row) return; // navigated away from Settings — download keeps running in the background regardless
+  row.outerHTML = offlineRowHtml();
+  wireOfflineRow();
+}
+function updateOfflineProgress() {
+  const fill = $('#dl-fill'), text = $('#dl-text');
+  if (!fill || !text) return;
+  const pct = downloadState.total ? Math.round((downloadState.done / downloadState.total) * 100) : 0;
+  fill.style.width = pct + '%';
+  text.textContent = `${downloadState.done}/${downloadState.total} · ${pct}%`;
+}
+async function startOfflineDownload() {
+  if (downloadState.active) return;
+  downloadState = { active: true, done: 0, total: 0, failed: 0, controller: new AbortController() };
+  renderOfflineSection();
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  await ensureCatalog();
+  const all = [...catalogMap.values()];
+  const signal = downloadState.controller.signal;
+  downloadState.total = all.length;
+  updateOfflineProgress();
+  let idx = 0;
+  async function worker() {
+    while (idx < all.length) {
+      if (signal.aborted) return;
+      const ex = all[idx++];
+      try { await fetch(ex.gif, { signal }); }
+      catch (e) { if (!signal.aborted) downloadState.failed++; }
+      downloadState.done++;
+      updateOfflineProgress();
+    }
+  }
+  await Promise.all(Array.from({ length: 6 }, worker));
+  if (!signal.aborted) {
+    state.offlineReady = { at: Date.now(), total: downloadState.total, failed: downloadState.failed };
+    save();
+  }
+  downloadState.active = false;
+  renderOfflineSection();
+}
+function cancelOfflineDownload() {
+  if (downloadState.controller) downloadState.controller.abort();
+  downloadState.active = false;
+  renderOfflineSection();
 }
 
 /* ---------- rest timer ---------- */
