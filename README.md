@@ -74,17 +74,27 @@ Minimum Android 8.0 (API 26, required by Health Connect), target API 35.
 
 ## Gym Buddy Web (PWA)
 
-The [`web/`](web/) folder contains a **zero-build, installable PWA** for a fixed
-**6-day workout split** (Chest+Shoulders · Back+Biceps · Legs+Core · Chest+Triceps ·
-Back+Shoulders · Arms+Legs · Rest), designed to be used *at the gym*:
+The [`web/`](web/) folder contains a **zero-build, installable PWA**, designed to be used
+*at the gym*, built around a default **6-day workout split** (Chest+Shoulders · Back+Biceps ·
+Legs+Core · Chest+Triceps · Back+Shoulders · Arms+Legs · Rest) that's fully customizable:
 
 - **Today view** auto-selects the day's workout; every exercise has an **animated
   illustration and step-by-step instructions** from the same dataset.
+- **Customizable plan**: change the number of training days per week and the start
+  weekday, reorder/add/remove days from templates or blank, and **swap or add any
+  exercise on any day** — edits persist and drive tracking immediately.
+- **Library tab**: all **1,324 exercises**, grouped by muscle, with instant **fuzzy
+  search** — tap any result for its steps and illustration. The full catalog is loaded
+  into IndexedDB **lazily** (only the first time you open Library or the exercise
+  picker), so first load stays fast.
 - **Set-by-set tracking** (weight × reps) with prefill from your last session, a
   **rest countdown** (vibration + beep), a screen wake-lock, and a **progression hint**
   (top of rep range on all sets → +2.5%).
 - **History & backup**: sessions in `localStorage`, JSON export/import.
-- **100% offline** once loaded — the service worker precaches the app and all 34 GIFs (~3 MB).
+- **Install prompt**: proactively offers "Add to Home Screen" so it opens full-screen
+  like a native app (with an iOS Safari fallback hint).
+- **100% offline** once loaded — the service worker precaches the app shell and the 34
+  curated GIFs (~3 MB); the full library's data/media are cached as you browse them.
 
 **Live app:** https://aswinavofficial.github.io/gym-buddy/ — open on your phone and
 "Add to Home screen" to run it like a native app.
